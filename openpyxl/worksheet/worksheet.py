@@ -27,6 +27,7 @@ from __future__ import absolute_import
 
 # Python stdlib imports
 import re
+from numbers import Integral
 
 # package imports
 import openpyxl.cell
@@ -416,6 +417,186 @@ class Worksheet(object):
         elif self._styles[coordinate].static and not read_only:
             self._styles[coordinate] = self._styles[coordinate].copy()
         return self._styles[coordinate]
+
+    def apply_vectorized_style(self, rows=None, cols=None, style=None,
+                               copy_style=True, shared=True, **style_kwargs):
+        """Apply a style to entire rows or columns without iterating cells.
+
+        This leverages Excel's built-in row and column default formatting,
+        letting callers express styling intentions vectorially.
+
+        :param rows: Row indices (int, slice, range, or iterable of ints)
+        :param cols: Column identifiers (str like 'A', int index, slice,
+                     range, iterable, or Excel-like range string 'A:D')
+        :param style: Existing :class:`~openpyxl.styles.Style` to reuse
+        :param copy_style: When True (default) copy the provided style before
+                           modification to avoid mutating the original
+        :param shared: When True (default) reuse the same Style instance for
+                       all targets (with static flag set); when False, assign
+                       independent copies per target.
+        :param style_kwargs: Keyword overrides for style attributes, e.g.
+                             font=Font(bold=True)
+
+        Exactly one of ``rows`` or ``cols`` must be provided.
+        """
+        if (rows is None and cols is None) or (rows is not None and cols is not None):
+            raise ValueError("Specify rows or cols (exclusively) for vectorized styling.")
+
+        if style is None:
+            base_style = Style()
+        else:
+            if not isinstance(style, Style):
+                raise TypeError("style must be an openpyxl.styles.Style instance.")
+            base_style = style.copy() if copy_style else style
+
+        if style_kwargs:
+            # Ensure we don't mutate the source style when copy_style=False
+            if base_style is style and copy_style is False:
+                base_style = base_style.copy()
+            for attr, value in style_kwargs.items():
+                if not hasattr(base_style, attr):
+                    raise AttributeError("Unknown style attribute '%s'" % attr)
+                setattr(base_style, attr, value)
+
+        def _clone_style(template):
+            clone = template.copy()
+            clone.static = template.static
+            return clone
+
+        if rows is not None:
+            targets = self._normalize_row_vector(rows)
+            apply_to = "row"
+        else:
+            targets = self._normalize_col_vector(cols)
+            apply_to = "col"
+
+        if not targets:
+            return
+
+        if shared:
+            base_style.static = True
+
+        for target in targets:
+            assigned_style = base_style if shared else _clone_style(base_style)
+
+            if apply_to == "row":
+                if target not in self.row_dimensions:
+                    self.row_dimensions[target] = RowDimension(target)
+                self._styles[target] = assigned_style
+            else:
+                if target not in self.column_dimensions:
+                    self.column_dimensions[target] = ColumnDimension(target)
+                self._styles[target] = assigned_style
+
+    def _normalize_row_vector(self, rows):
+        """Return a tuple of integer row indexes from various user inputs."""
+        if isinstance(rows, basestring):
+            token = rows.replace('$', '')
+            if ':' in token:
+                start_text, stop_text = token.split(':', 1)
+                try:
+                    start = int(start_text)
+                    stop = int(stop_text)
+                except ValueError:
+                    raise ValueError("Row range strings must be numeric like '1:10'.")
+                step = 1 if stop >= start else -1
+                normalized = list(range(start, stop + step, step))
+            else:
+                try:
+                    normalized = [int(token)]
+                except ValueError:
+                    raise ValueError("Row labels supplied as strings must be numeric.")
+        elif isinstance(rows, Integral):
+            normalized = [int(rows)]
+        elif isinstance(rows, slice):
+            start = rows.start
+            stop = rows.stop
+            if start is None or stop is None:
+                raise ValueError("Row slices must define both start and stop.")
+            step = rows.step or 1
+            if step == 0:
+                raise ValueError("Row slice step cannot be zero.")
+            normalized = list(range(int(start), int(stop), step))
+        else:
+            try:
+                normalized = [int(value) for value in rows]
+            except TypeError:
+                raise TypeError("rows must be an int, slice, range, or iterable of ints.")
+
+        for value in normalized:
+            if value < 1:
+                raise ValueError("Row indexes must be 1-based positive integers.")
+
+        # preserve order, remove duplicates
+        seen = set()
+        unique = []
+        for value in normalized:
+            if value not in seen:
+                seen.add(value)
+                unique.append(value)
+        return tuple(unique)
+
+    def _normalize_col_vector(self, cols):
+        """Return a tuple of column letters from various user inputs."""
+        def _as_index(value):
+            if isinstance(value, Integral):
+                if value < 1:
+                    raise ValueError("Column indexes must be >= 1.")
+                return value
+            if isinstance(value, basestring):
+                token = value.replace('$', '').upper()
+                if token.isdigit():
+                    return int(token)
+                return column_index_from_string(token)
+            raise TypeError("Invalid column identifier: %r" % (value,))
+
+        def _letters_between(start, stop, step=None):
+            start_idx = _as_index(start)
+            stop_idx = _as_index(stop)
+            if step is None:
+                step = 1 if stop_idx >= start_idx else -1
+            if step == 0:
+                raise ValueError("slice step cannot be zero.")
+            incremental = 1 if step > 0 else -1
+            stop_idx += incremental
+            return [get_column_letter(idx) for idx in range(start_idx, stop_idx, step)]
+
+        if isinstance(cols, basestring):
+            token = cols.replace('$', '').upper()
+            if ':' in token:
+                start, finish = token.split(':', 1)
+                normalized = _letters_between(start, finish, 1)
+            else:
+                normalized = [token]
+        elif isinstance(cols, Integral):
+            normalized = [get_column_letter(int(cols))]
+        elif isinstance(cols, slice):
+            if cols.start is None or cols.stop is None:
+                raise ValueError("Column slices must define both start and stop.")
+            step = cols.step or 1
+            start_idx = _as_index(cols.start)
+            stop_idx = _as_index(cols.stop)
+            normalized = [get_column_letter(idx) for idx in range(start_idx, stop_idx, step)]
+        else:
+            try:
+                normalized = []
+                for value in cols:
+                    idx = _as_index(value)
+                    normalized.append(get_column_letter(idx))
+            except TypeError:
+                raise TypeError("cols must be a column designator or iterable of designators.")
+
+        for label in normalized:
+            if not isinstance(label, basestring):
+                raise TypeError("Column labels must resolve to strings.")
+
+        seen = set()
+        unique = []
+        for label in normalized:
+            if label not in seen:
+                seen.add(label)
+                unique.append(label)
+        return tuple(unique)
 
     def set_printer_settings(self, paper_size, orientation):
         """Set printer settings """
